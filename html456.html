@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Face Recognition Demo (face-api.js)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial; display:flex; gap:12px; padding:16px; }
+    #left { width: 720px; }
+    video, canvas { width: 720px; height: 540px; border-radius:8px; background:#111; }
+    #controls { display:flex; gap:8px; align-items:center; margin-top:8px; }
+    #labels { max-width:300px; }
+    input[type=text] { padding:6px; }
+    button { padding:6px 10px; }
+    .enroll-item { margin-bottom:8px; }
+  </style>
+</head>
+<body>
+  <div id="left">
+    <h2>Face Recognition demo</h2>
+    <video id="video" autoplay muted playsinline></video>
+    <canvas id="overlay"></canvas>
+    <div id="controls">
+      <input id="nameInput" type="text" placeholder="Name for enrollment" />
+      <input id="imageUpload" type="file" accept="image/*" />
+      <button id="enrollBtn">Enroll from image</button>
+      <button id="startBtn">Start webcam</button>
+      <button id="stopBtn">Stop webcam</button>
+    </div>
+    <p style="font-size:13px;color:#444">Notes: this demo uses face-api.js models which must be downloaded and hosted in <code>/models</code>. See instructions below.</p>
+  </div>
+
+  <div id="labels">
+    <h3>Enrolled people</h3>
+    <div id="peopleList"></div>
+    <hr />
+    <h3>Match log</h3>
+    <div id="log"></div>
+  </div>
+
+<script src="https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js"></script>
+<script>
+// -------------------------
+// Simple face recognition demo using face-api.js
+// -------------------------
+
+// IMPORTANT: Download the face-api models and place them in a folder named \"models\" served by the same origin.
+// Models required in this demo: face_detection_model, face_landmark_68_model, face_recognition_model
+// You can get them from the face-api.js repository (models folder) and serve alongside this file.
+
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const ctx = overlay.getContext('2d');
+let stream = null;
+let isRunning = false;
+
+const labeledDescriptors = []; // {label: string, descriptors: Float32Array[]}
+
+async function loadModels() {
+  const MODEL_URL = './models';
+  // loadTinyFaceDetector or SSD Mobilenetv1 are options. We'll load SSD for better accuracy.
+  await Promise.all([
+    faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL),
+    faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+    faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL)
+  ]);
+}
+
+function resizeCanvas() {
+  overlay.width = video.videoWidth || 720;
+  overlay.height = video.videoHeight || 540;
+}
+
+async function startWebcam() {
+  if (isRunning) return;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { width: 720, height: 540 }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+    resizeCanvas();
+    isRunning = true;
+    runRecognitionLoop();
+  } catch (err) {
+    alert('Could not access webcam: ' + err.message);
+  }
+}
+
+function stopWebcam() {
+  if (!isRunning) return;
+  if (stream) {
+    stream.getTracks().forEach(t => t.stop());
+  }
+  isRunning = false;
+  ctx.clearRect(0,0,overlay.width,overlay.height);
+}
+
+async function runRecognitionLoop() {
+  if (!isRunning) return;
+  // detect single frame
+  const detections = await faceapi.detectAllFaces(video).withFaceLandmarks().withFaceDescriptors();
+
+  // clear
+  ctx.clearRect(0,0,overlay.width,overlay.height);
+  ctx.lineWidth = 2;
+  ctx.font = '16px sans-serif';
+  ctx.strokeStyle = 'lime';
+  ctx.fillStyle = 'lime';
+
+  detections.forEach(det => {
+    const box = det.detection.box;
+    ctx.strokeRect(box.x, box.y, box.width, box.height);
+    // recognition: compare descriptor
+    const best = findBestMatch(det.descriptor);
+    const label = best ? `${best.label} (${best.distance.toFixed(3)})` : 'Unknown';
+    ctx.fillText(label, box.x, box.y > 20 ? box.y - 6 : box.y + 12);
+  });
+
+  // schedule next frame
+  requestAnimationFrame(runRecognitionLoop);
+}
+
+function euclideanDistance(a, b) {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) {
+    const d = a[i] - b[i];
+    sum += d * d;
+  }
+  return Math.sqrt(sum);
+}
+
+function findBestMatch(queryDescriptor) {
+  if (labeledDescriptors.length === 0) return null;
+  let best = { label: null, distance: Infinity };
+  labeledDescriptors.forEach(ld => {
+    ld.descriptors.forEach(desc => {
+      const dist = euclideanDistance(queryDescriptor, desc);
+      if (dist < best.distance) best = { label: ld.label, distance: dist };
+    });
+  });
+  // threshold: typical 0.6 for face-api.js; you can tune
+  if (best.distance > 0.6) return null;
+  return best;
+}
+
+// Enroll an image file with a name (computes descriptor(s) and stores)
+async function enrollImage(file, label) {
+  if (!file || !label) return;
+  const img = await faceapi.bufferToImage(file);
+  const detections = await faceapi.detectSingleFace(img).withFaceLandmarks().withFaceDescriptor();
+  if (!detections) {
+    alert('No face detected in the uploaded image. Try another image.');
+    return;
+  }
+  // store descriptor
+  const desc = detections.descriptor;
+  const existing = labeledDescriptors.find(x => x.label === label);
+  if (existing) existing.descriptors.push(desc);
+  else labeledDescriptors.push({ label, descriptors: [desc] });
+  refreshPeopleList();
+  logMessage(`Enrolled ${label} (1 image)`);
+}
+
+function refreshPeopleList() {
+  const container = document.getElementById('peopleList');
+  container.innerHTML = '';
+  labeledDescriptors.forEach(ld => {
+    const div = document.createElement('div');
+    div.className = 'enroll-item';
+    div.textContent = `${ld.label} — ${ld.descriptors.length} image(s)`;
+    container.appendChild(div);
+  });
+}
+
+function logMessage(msg) {
+  const lg = document.getElementById('log');
+  const p = document.createElement('div');
+  p.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  lg.prepend(p);
+}
+
+// wire up UI
+document.getElementById('startBtn').addEventListener('click', async () => {
+  await loadModels();
+  startWebcam();
+});
+document.getElementById('stopBtn').addEventListener('click', () => stopWebcam());
+
+document.getElementById('enrollBtn').addEventListener('click', async () => {
+  const fileInput = document.getElementById('imageUpload');
+  const name = document.getElementById('nameInput').value.trim();
+  if (!fileInput.files[0]) { alert('Choose an image to enroll'); return; }
+  if (!name) { alert('Enter a name for this person'); return; }
+  await loadModels();
+  await enrollImage(fileInput.files[0], name);
+});
+
+// resize overlay when video metadata loads
+video.addEventListener('loadedmetadata', resizeCanvas);
+
+</script>
+</body>
+</html>
